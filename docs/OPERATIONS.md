@@ -45,11 +45,30 @@ curl -X POST -H 'Content-Type: application/json' -d '{"confirm":true}' \
 
 | 场景 | 行为 |
 |---|---|
-| API 在上传中崩溃 | 重启后该件标 `failed`（不晚发布）；blob 残片可按 failed 行清理 |
+| API 在上传中崩溃 | 重启后该件标 `failed`（不晚发布、不入交接流）；blob 残片可按 failed 行清理 |
 | API 在轮换中崩溃 | 重启后后台线程自动接续未完成作业到终态 |
 | 崩溃于"MK 已切换、作业未建"窗口 | 启动对账自动补建迁移作业 |
 | 密钥服务重启 | 主密钥从卷内 SQLite 恢复，已入湖原片逐字节可读 |
 | 销毁回执丢失 | KeyClient 重试并以 `/internal/master/status` 只读核实 |
+| 交接领取未确认时重启 | 游标/领取记录均在 SQLite；消费者重新领取即从未确认位置续页（新令牌） |
+| 确认回执丢失 | 同令牌 + 同 upto_seq 重试返回已确认进度（幂等） |
+
+## 5.1 增量交接运维
+
+- 交接状态全部在 api-data 卷的 `metadata.db`：`handoff_stream`（发布流，
+  只增不删）、`handoff_cursor`（单行已确认游标）、`handoff_claims`
+  （领取/确认记录）。与 `images` 同事务写入，备份 api-data 即一并备份。
+- 消费者以 `POST /handoff/claims` 轮询领取；空页（`claim_token: null`）
+  表示没有待交接原片，稍后再领。
+- 租约由 `HANDOFF_LEASE_SECONDS` 控制（默认 300s），单次领取也可在请求体
+  用 `lease_seconds` 调整（1~3600s）；单页上限 `HANDOFF_MAX_PAGE`
+  （默认 500）。
+- 租约到期或消费者重启：直接重新领取即可，旧令牌自动作废；确认被拒时
+  看错误码（`lease_expired`/`claim_superseded` -> 重新领取；
+  `already_confirmed` -> 以已落盘的确认进度为准）。
+- 上线本版本前已 `ready` 的历史原片会在首次启动时按发布时间回填进交接流
+  （幂等，只补一次）；如不希望分析程序处理历史积压，可在首次启动前
+  手工把 `handoff_cursor.confirmed_seq` 置为当时最大 seq。
 
 ## 6. 已知限制（单实例/SQLite 范围之外）
 

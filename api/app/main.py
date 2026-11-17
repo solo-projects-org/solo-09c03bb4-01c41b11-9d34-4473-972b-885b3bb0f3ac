@@ -23,6 +23,9 @@ DB_PATH = os.environ.get("METADATA_DB", "/data/metadata.db")
 KEY_SERVICE_URL = os.environ.get("KEY_SERVICE_URL", "http://keystore:8001")
 KEY_SERVICE_TOKEN = os.environ.get("KEY_SERVICE_TOKEN", "dev-only-key-service-token")
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(20 * 1024 ** 3)))
+# 增量交接：领取令牌的默认租约时长与单页上限
+HANDOFF_LEASE_SECONDS = float(os.environ.get("HANDOFF_LEASE_SECONDS", "300"))
+HANDOFF_MAX_PAGE = int(os.environ.get("HANDOFF_MAX_PAGE", "500"))
 
 # 安全约束：Starlette 的 multipart 解析器默认把 >1MiB 的表单文件假脱机到
 # 磁盘临时文件，等于让明文原片落盘。将假脱机阈值提高到上传上限，使允许范围
@@ -33,7 +36,7 @@ MultiPartParser.spool_max_size = MAX_UPLOAD_BYTES
 
 from .crypto_stream import IntegrityError, decrypt_stream, encrypt_stream
 from .keyclient import KeyClient, KeyServiceError
-from .metadata import MetadataDB
+from .metadata import ClaimError, MetadataDB
 from .rotation import RotationWorker
 
 db = MetadataDB(DB_PATH)
@@ -86,8 +89,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Microscopy Image Warehouse API",
-    version="1.0.0",
-    description="原片流式加密存取，每件独立 DEK；支持主密钥在线轮换与进度查询。",
+    version="1.1.0",
+    description="原片流式加密存取，每件独立 DEK；支持主密钥在线轮换与进度查询；"
+                "为分析程序提供按发布顺序的增量交接（领取/确认/续领）。",
     lifespan=lifespan,
 )
 
@@ -328,6 +332,71 @@ async def image_meta(image_id: str):
         raise HTTPException(404, detail="image not found")
     meta.pop("wrapped_dek", None)
     return meta
+
+
+# --------------------------------------------------------------------------
+# 增量交接（单一固定消费者：显微图像分析程序）
+#
+# 语义：
+#   * 原片发布为 ready 的同一事务内进入交接流，seq 即实际发布顺序；
+#     失败上传不入流，幂等重放与主密钥改包不会重复交接；
+#   * 消费者领取"第一个未确认位置起的连续一页" + 限时令牌，取数
+#     （GET /images/{image_id}）处理后按令牌确认进度；
+#   * 未确认（含租约到期、进程重启）可重新领取：新领取签发新令牌，
+#     旧令牌被取代、不能再确认，未确认原片随新页原样重发，不会被跳过；
+#   * 确认回执丢失时，同一令牌 + 同一 upto_seq 重试仍返回已确认进度。
+# --------------------------------------------------------------------------
+class ClaimRequest(BaseModel):
+    limit: int = 100                 # 本页条数上限（服务端再钳制到 HANDOFF_MAX_PAGE）
+    lease_seconds: float | None = None  # 令牌租约秒数，缺省用服务端配置
+
+
+class ConfirmRequest(BaseModel):
+    upto_seq: int                    # 已处理到的流序号（含），须在领取页范围内
+
+
+def _claim_error(exc: ClaimError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code,
+                         detail={"code": exc.code, "message": exc.message})
+
+
+@app.post("/handoff/claims", status_code=201,
+          summary="领取一页待处理原片（连续 seq + 限时令牌）")
+def create_handoff_claim(req: ClaimRequest, response: Response):
+    if req.limit < 1:
+        raise HTTPException(422, detail="limit must be >= 1")
+    lease = HANDOFF_LEASE_SECONDS if req.lease_seconds is None \
+        else min(max(req.lease_seconds, 1.0), 3600.0)
+    claim = db.create_claim(min(req.limit, HANDOFF_MAX_PAGE), lease)
+    if claim is None:  # 没有待交接内容：不签发令牌，消费者稍后重试
+        response.status_code = 200
+        status = db.handoff_status()
+        return {"claim_token": None, "items": [],
+                "confirmed_seq": status["confirmed_seq"], "pending": 0}
+    return claim
+
+
+@app.post("/handoff/claims/{token}/confirm",
+          summary="确认本页已处理到的进度（同令牌重试幂等）")
+def confirm_handoff_claim(token: str, req: ConfirmRequest):
+    try:
+        return db.confirm_claim(token, req.upto_seq)
+    except ClaimError as exc:
+        raise _claim_error(exc)
+
+
+@app.get("/handoff/claims/{token}", summary="按令牌查询领取/确认状态")
+def handoff_claim_view(token: str):
+    view = db.get_claim(token)
+    if view is None:
+        raise HTTPException(404, detail={"code": "claim_not_found",
+                                         "message": "unknown claim token"})
+    return view
+
+
+@app.get("/handoff/status", summary="交接游标与待处理统计")
+def handoff_status():
+    return db.handoff_status()
 
 
 # --------------------------------------------------------------------------

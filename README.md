@@ -60,6 +60,10 @@ docker compose up --build
 | `GET /rotations/{job_id}` | 轮换进度（state/migrated/failed/progress_percent） |
 | `GET /rotations/latest` | 最近一次轮换 |
 | `GET /keys/status` | 代理密钥服务只读状态 |
+| `POST /handoff/claims` | 领取一页待交接原片（连续 seq + 限时令牌）；无待交接时返回空页 |
+| `POST /handoff/claims/{token}/confirm` | 确认本页已处理到的 seq（同令牌重试幂等） |
+| `GET /handoff/claims/{token}` | 按令牌查询领取/确认状态 |
+| `GET /handoff/status` | 交接游标、已发布/待处理计数、当前未完成的领取 |
 
 上传请使用原始 `application/octet-stream`（`curl --data-binary @file`），
 避免 multipart 带来的额外内存占用。
@@ -79,6 +83,39 @@ sha256sum slide_001.czi /tmp/slide_001.czi
 JOB=$(curl -sS -X POST -H 'Content-Type: application/json' \
   -d '{"confirm":true}' http://localhost:8000/rotations | python3 -c 'import sys,json;print(json.load(sys.stdin)["job_id"])')
 watch -n1 "curl -sS http://localhost:8000/rotations/$JOB"
+```
+
+## 增量交接（显微图像分析程序）
+
+单一固定消费者按"实际发布顺序"持续领取新入仓原片，断线/重启后从未处理的
+位置继续：
+
+1. **发布即入流**：密文写完、原片发布为 `ready` 的**同一事务**内，
+   `(image_id, sha256, size)` 追加入 `handoff_stream`，自增 `seq` 即发布
+   顺序。失败上传不入流；幂等重放与主密钥改包（rewrap）不会产生重复交接；
+   慢上传只在完成发布时才进入流尾，不会被已确认的游标漏掉。
+2. **领取**：`POST /handoff/claims`（body `{"limit": N, "lease_seconds": S}`，
+   均可选）返回从第一个未确认位置起的**连续一页**（含每件的
+   `seq/image_id/sha256/size`）与**限时令牌**及到期时间。没有待交接内容时
+   返回空页、不签发令牌。
+3. **取数处理**：按页内 `image_id` 调 `GET /images/{image_id}` 下载处理。
+4. **确认**：`POST /handoff/claims/{token}/confirm`，body
+   `{"upto_seq": S}`（S 须在本页范围内，可部分确认）。确认进度随令牌
+   持久化，游标同步推进。
+5. **续领**：未确认（含租约到期、消费者或 API 重启）可再次领取——从第一
+   个未确认位置重新发页并签发**新令牌**，旧令牌同时被取代、不能再确认，
+   因此旧令牌无法跳过新入流的原片。
+6. **回执丢失**：确认已落盘但响应丢失时，用**同一令牌 + 同一 upto_seq**
+   重试仍返回已确认进度（`idempotent: true`），即使该令牌此后已过期或
+   被取代；`GET /handoff/claims/{token}` 与 `GET /handoff/status` 也可查。
+
+```bash
+# 领取一页（100 条以内，租约 300s）
+curl -sS -X POST -H 'Content-Type: application/json' \
+  -d '{"limit": 100}' http://localhost:8000/handoff/claims
+# 处理完后确认到 seq=42
+curl -sS -X POST -H 'Content-Type: application/json' \
+  -d '{"upto_seq": 42}' http://localhost:8000/handoff/claims/<token>/confirm
 ```
 
 ## 轮换语义（需求对照）
@@ -114,7 +151,7 @@ KEY_DESTROY_DROP_RECEIPT=true docker compose up --build keystore
 ## 自测
 
 ```bash
-# tests/ 下为真实 uvicorn 子进程的端到端测试（22 项，含离线加密单测）
+# tests/ 下为真实 uvicorn 子进程的端到端测试（33 项，含离线加密单测）
 python -m pytest tests/ -q
 ```
 
@@ -123,7 +160,9 @@ python -m pytest tests/ -q
 篡改 GCM 失败、完整轮换（信封迁移+正文不动+二次轮换仍不动+销毁后可读）、
 进度与并发轮换拒绝、慢密钥服务并发、在途下载跨销毁、销毁丢回执自动核实、
 双服务重启可读性、轮换中途重启接续、崩溃在途上传不晚发布、
-跨越轮换的上传自动改绑。
+跨越轮换的上传自动改绑；增量交接（发布顺序、失败/重放/改包不入流、
+限时令牌续领、旧令牌不跳过新片、确认回执丢失幂等、重启续领、
+慢上传不漏、历史原片回填）。
 
 ## 限制与生产化建议（见 docs/ 下说明）
 
